@@ -1,19 +1,29 @@
+"""
+"""
 import json
 import sqlite3
 import time
 from typing import Optional
-from datetime import datetime
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
+import asyncio
+import logging
 
 load_dotenv()
 
+# Configure structured logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("ai_stream")
+
 DB_PATH = "conversations.db"
 
-# Initialize DB
+# Init DB (messages) and ensure metadata column exists
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -28,54 +38,138 @@ def init_db():
         )"""
     )
     conn.commit()
+    # Ensure metadata column exists (for redaction info etc.)
+    c.execute("PRAGMA table_info(messages)")
+    cols = [row[1] for row in c.fetchall()]  # row[1] is column name
+    if "metadata" not in cols:
+        try:
+            c.execute("ALTER TABLE messages ADD COLUMN metadata TEXT")
+            conn.commit()
+        except Exception as e:
+            logger.debug("Could not add metadata column to messages table: %s", e)
     conn.close()
 
 init_db()
 
-app = FastAPI(title="AI_Stream — interactive chat + experience logger")
+# Import Memory & OpenAI helpers
+from src.memory import Memory  # ensure src/memory.py exists
+from src.openai_client import call_openai_chat
 
+# Import moderation helpers
+from src.moderation import redact_pii, is_allowed
+
+memory = Memory(db_path=DB_PATH)
+
+app = FastAPI(title="AI_Stream — interactive chat + memory + OpenAI + redaction + logging")
 
 class ChatRequest(BaseModel):
     session_id: str
     user: str
     message: str
 
+class RememberRequest(BaseModel):
+    session_id: str
+    user: str
+    content: str
+    metadata: Optional[dict] = None
+
 
 def log_message(session_id: str, role: str, user: str, content: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO messages (session_id, role, user, content, ts) VALUES (?, ?, ?, ?, ?)",
-        (session_id, role, user, content, time.time()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def generate_reply_placeholder(session_id: str, user: str, message: str) -> str:
     """
-    Replace this with a real model call (OpenAI, HF local model, etc).
-    For now it's a stable placeholder that echoes and suggests next action.
+    Redact content before saving, store redaction metadata in messages.metadata.
+    Returns the redacted content and metadata dict (useful for callers).
     """
-    # Simple deterministic reply to avoid drift during early data collection
-    reply = f"I heard: '{message}'. Tell me more or ask me to remember something!"
-    return reply
-
+    try:
+        redacted, details = redact_pii(content)
+        allowed = is_allowed(content)
+        meta = {"redaction": details, "allowed": allowed}
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Ensure metadata column exists in case DB was created earlier without it
+        try:
+            c.execute(
+                "INSERT INTO messages (session_id, role, user, content, ts, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, role, user, redacted, time.time(), json.dumps(meta)),
+            )
+        except sqlite3.OperationalError:
+            # Fallback if metadata column doesn't exist (very old DB): insert without metadata
+            c.execute(
+                "INSERT INTO messages (session_id, role, user, content, ts) VALUES (?, ?, ?, ?, ?)",
+                (session_id, role, user, redacted, time.time()),
+            )
+        conn.commit()
+        conn.close()
+        logger.debug("Logged message session=%s role=%s user=%s redaction=%s", session_id, role, user, details)
+        return redacted, meta
+    except Exception as e:
+        logger.exception("Failed to log message: %s", e)
+        # On failure, still return the original content and minimal meta
+        return content, {"redaction": {}, "allowed": True}
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not req.message:
         raise HTTPException(status_code=400, detail="No message provided")
-    # Log user message
-    log_message(req.session_id, "user", req.user, req.message)
-    # Get reply (swap this with a model call)
-    reply = generate_reply_placeholder(req.session_id, req.user, req.message)
-    # Log assistant reply
+
+    # Log (and redact) user message
+    redacted_msg, msg_meta = log_message(req.session_id, "user", req.user, req.message)
+
+    # Quick explicit "remember:" handling (store memory locally rather than sending to OpenAI)
+    msg_strip = req.message.strip()
+    if msg_strip.lower().startswith("remember:"):
+        to_remember_orig = msg_strip[len("remember:"):].strip()
+        if to_remember_orig:
+            # Redact memory content before storing and run allow check
+            redacted_mem, mem_details = redact_pii(to_remember_orig)
+            allowed = is_allowed(to_remember_orig)
+            if not allowed:
+                ack = "Cannot save memory: content not allowed (possible profanity or PII)."
+                # Log assistant reply (redacted) and return the ack
+                log_message(req.session_id, "assistant", "AI_Stream", ack)
+                return {"reply": ack}
+            # Save memory with metadata including redaction details
+            mid = memory.add_memory(req.session_id, req.user, redacted_mem, metadata={"redaction": mem_details})
+            ack = f"Saved memory id={mid}: {redacted_mem}"
+            log_message(req.session_id, "assistant", "AI_Stream", ack)
+            return {"reply": ack}
+
+    # Otherwise call OpenAI with memories + recent context
+    try:
+        reply = await call_openai_chat(DB_PATH, memory, req.session_id, req.user, req.message)
+    except Exception as e:
+        logger.exception("OpenAI call failed for session=%s user=%s: %s", req.session_id, req.user, e)
+        reply = f"I had trouble contacting the model. (error: {e}). Meanwhile, I heard: '{req.message}'."
+
+    # Log assistant reply (redacted before storing; return original reply to user)
     log_message(req.session_id, "assistant", "AI_Stream", reply)
     return {"reply": reply}
 
+@app.post("/remember")
+async def remember(req: RememberRequest):
+    """
+    Explicit endpoint to store a memory. Redacts PII before storing.
+    If content fails `is_allowed`, reject storing.
+    """
+    redacted, details = redact_pii(req.content)
+    allowed = is_allowed(req.content)
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Memory content not allowed (profanity/PII).")
+    mid = memory.add_memory(req.session_id, req.user, redacted, metadata={"redaction": details, **(req.metadata or {})})
+    # Log the explicit action (assistant ack)
+    ack = f"Saved memory id={mid}: {redacted}"
+    log_message(req.session_id, "assistant", "AI_Stream", ack)
+    return {"status": "ok", "memory_id": mid, "redaction": details}
 
-# Simple WebSocket manager for streaming chat in and out
+@app.get("/memory/search")
+async def memory_search(q: str = Query(..., alias="query"), top_k: int = 5, min_sim: float = 0.3):
+    try:
+        results = memory.search(q, top_k=top_k, min_similarity=min_sim)
+        return {"query": q, "results": results}
+    except Exception as e:
+        logger.exception("Memory search failed for query=%s: %s", q, e)
+        raise HTTPException(status_code=500, detail="Memory search failed")
+
+# WebSocket endpoint reuses the same flow (OpenAI) and redacts when storing
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
@@ -93,15 +187,14 @@ class ConnectionManager:
         if ws:
             await ws.send_text(message)
 
-
 manager = ConnectionManager()
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Expect first message to be a JSON string: {"session_id": "...", "user": "..."}
-    Then subsequent messages: {"message": "..."}
+    First message must be JSON: {"session_id":"...", "user":"..."}
+    Then subsequent messages: {"message":"..."}
+    Messages starting with "remember:" will be saved (redacted) and acknowledged immediately.
     """
     try:
         init_msg = await websocket.receive_text()
@@ -112,7 +205,6 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close(code=4001)
             return
         await manager.connect(session_id, websocket)
-        # Acknowledge
         await websocket.send_text(json.dumps({"system": "connected", "session_id": session_id}))
         while True:
             data = await websocket.receive_text()
@@ -121,15 +213,39 @@ async def websocket_endpoint(websocket: WebSocket):
             if not message:
                 await websocket.send_text(json.dumps({"error": "no message provided"}))
                 continue
-            # Log user message
+
+            # Log (and redact) user message
             log_message(session_id, "user", user, message)
-            # Generate reply
-            reply = generate_reply_placeholder(session_id, user, message)
-            # Log assistant reply
+
+            # handle remember:
+            msg_strip = message.strip()
+            if msg_strip.lower().startswith("remember:"):
+                to_remember_orig = msg_strip[len("remember:"):].strip()
+                if to_remember_orig:
+                    redacted_mem, mem_details = redact_pii(to_remember_orig)
+                    allowed = is_allowed(to_remember_orig)
+                    if not allowed:
+                        ack = "Cannot save memory: content not allowed (possible profanity or PII)."
+                        log_message(session_id, "assistant", "AI_Stream", ack)
+                        await websocket.send_text(json.dumps({"reply": ack}))
+                        continue
+                    mid = memory.add_memory(session_id, user, redacted_mem, metadata={"redaction": mem_details})
+                    ack = f"Saved memory id={mid}: {redacted_mem}"
+                    log_message(session_id, "assistant", "AI_Stream", ack)
+                    await websocket.send_text(json.dumps({"reply": ack}))
+                    continue
+
+            # call OpenAI
+            try:
+                reply = await call_openai_chat(DB_PATH, memory, session_id, user, message)
+            except Exception as e:
+                logger.exception("OpenAI call failed (ws) for session=%s user=%s: %s", session_id, user, e)
+                reply = f"I had trouble contacting the model. (error: {e}). I heard: '{message}'."
+
+            # Log assistant reply (redacted before storing)
             log_message(session_id, "assistant", "AI_Stream", reply)
             await websocket.send_text(json.dumps({"reply": reply}))
     except WebSocketDisconnect:
-        # Cleanup
         try:
             manager.disconnect(session_id)
         except Exception:
@@ -144,8 +260,7 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+"""

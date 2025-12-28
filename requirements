@@ -1,0 +1,11 @@
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+python-dotenv==1.0.1
+pydantic==1.10.12
+requests==2.31.0
+# Optional for training / local models:
+transformers==4.40.0
+datasets==2.13.1
+accelerate==0.21.0
+peft==0.4.0
+bitsandbytes==0.39.0
